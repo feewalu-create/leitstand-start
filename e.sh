@@ -17,9 +17,36 @@ haupt() {   # alles in einer Funktion: bash liest das Skript vollstaendig ein, b
   [ -f /etc/leitstand/deploy_key ] || ssh-keygen -q -t ed25519 -N "" -C "leitstand@$NAME" -f /etc/leitstand/deploy_key </dev/null
   export GIT_SSH_COMMAND="ssh -i /etc/leitstand/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
   local REPO=git@github.com:feewalu-create/Leitstand.git
+  local STATUS_PID=""
+  if ! git ls-remote "$REPO" >/dev/null 2>&1 </dev/null && [ "$ROLLE" = agent ]; then
+    # Beim Leitstand anmelden: er traegt den Schluessel selbst bei GitHub ein (wenn dort ein GitHub-Token hinterlegt ist)
+    command -v age-keygen >/dev/null || { apt-get install -yq age; } </dev/null >/dev/null 2>&1 || true
+    [ -f /etc/leitstand/age.key ] || { age-keygen -o /etc/leitstand/age.key 2>/dev/null; chmod 600 /etc/leitstand/age.key; } || true
+    local TS_IP LS_IP; TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true); LS_IP=$(tailscale ip -4 leitstand 2>/dev/null | head -1 || true)
+    install -d -m 0755 /var/lib/leitstand/agent
+    printf '{"name": "%s", "anmeldung": true, "zustand": "wartet auf Freischaltung", "deploy_key": "%s", "age_empfaenger": "%s"}\n' \
+      "$NAME" "$(cat /etc/leitstand/deploy_key.pub)" "$(age-keygen -y /etc/leitstand/age.key 2>/dev/null || true)" > /var/lib/leitstand/agent/status.json
+    if [ -n "$TS_IP" ] && [ -n "$LS_IP" ]; then
+      python3 - /var/lib/leitstand/agent/status.json "$TS_IP" "$LS_IP" <<'PY' </dev/null &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+datei, bind, erlaubt = sys.argv[1], sys.argv[2], {"127.0.0.1", sys.argv[2], sys.argv[3]}
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.client_address[0] not in erlaubt or self.path != "/status.json":
+            self.send_response(403); self.end_headers(); return
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(open(datei, "rb").read())
+HTTPServer((bind, 8201), H).serve_forever()
+PY
+      STATUS_PID=$!
+      echo "Beim Leitstand angemeldet – er traegt den Schluessel selbst ein, sobald ein GitHub-Token hinterlegt ist."
+    fi
+  fi
   if ! git ls-remote "$REPO" >/dev/null 2>&1 </dev/null; then
     echo
-    echo "Diesen Schluessel auf GitHub eintragen: Leitstand -> Settings -> Deploy keys -> Add deploy key"
+    echo "Falls nicht automatisch: diesen Schluessel auf GitHub eintragen: Leitstand -> Settings -> Deploy keys -> Add deploy key"
     echo "Titel: leitstand-$NAME   (Haken bei 'Allow write access' NICHT setzen)"
     echo
     cat /etc/leitstand/deploy_key.pub
@@ -28,6 +55,7 @@ haupt() {   # alles in einer Funktion: bash liest das Skript vollstaendig ein, b
     until git ls-remote "$REPO" >/dev/null 2>&1 </dev/null; do sleep 10; done
     echo "Schluessel erkannt."
   fi
+  [ -n "$STATUS_PID" ] && kill "$STATUS_PID" 2>/dev/null || true
   [ -d /opt/leitstand/.git ] || git clone -q "$REPO" /opt/leitstand </dev/null
   git -C /opt/leitstand pull -q --ff-only </dev/null || true
   if [ "$ROLLE" = agent ]; then
